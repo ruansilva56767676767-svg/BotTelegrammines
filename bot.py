@@ -1,772 +1,214 @@
-import asyncio
-import logging
 import os
+import asyncio
 import random
 from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
-
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8784168989:AAEotzECNlSroRdVqpH0ccdhGi6qHeKZYAk")
-
-BETANO_URL = (
-    "https://www.betano.bet.br/casino/crash-games/games/"
-    "mines/25456/?entrypoint=1"
-)
-
+TOKEN = os.getenv('BOT_TOKEN', '8784168989:AAEotzECNlSroRdVqpH0ccdhGi6qHeKZYAk')
 MINES = 3
 STARS = 4
-
-VALID_SECONDS = 180       # 3 minutos
-PREPARE_SECONDS = 10      # mensagem "validando"
-NEXT_ROUND_DELAY = 60     # 1 minuto
-
 ATTEMPTS = 2
+PREPARE_SECONDS = 10
+VALID_SECONDS = 180
+RESTART_SECONDS = 60
 
-# ============================================================
-# LOG
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# ESTADO
-# ============================================================
-
-class BotState:
-
-    def __init__(self):
-        self.running = False
-        self.task = None
-
-        self.current_signal = None
-
-        self.green = 0
-        self.red = 0
-
-        self.total_signals = 0
-
-        # Guarda os usuários que já votaram no sinal atual
-        self.voters = set()
-
-        # Lock para evitar dois ciclos simultâneos
-        self.lock = asyncio.Lock()
+running = False
+cycle_task = None
+chat_id = None
+green_total = 0
+red_total = 0
+round_green = 0
+round_red = 0
+round_number = 0
 
 
-state = BotState()
+def gerar_grade():
+    posicoes = list(range(25))
+    random.shuffle(posicoes)
+    escolhidas = []
+    linhas = [0] * 5
+    colunas = [0] * 5
+    for pos in posicoes:
+        linha, coluna = divmod(pos, 5)
+        if linhas[linha] >= 2 or colunas[coluna] >= 2:
+            continue
+        escolhidas.append(pos)
+        linhas[linha] += 1
+        colunas[coluna] += 1
+        if len(escolhidas) == STARS:
+            break
+    if len(escolhidas) < STARS:
+        for pos in posicoes:
+            if pos not in escolhidas:
+                escolhidas.append(pos)
+                if len(escolhidas) == STARS:
+                    break
+    escolhidas = set(escolhidas)
+    return '\n'.join(
+        ''.join('⭐' if r * 5 + c in escolhidas else '🟦' for c in range(5))
+        for r in range(5)
+    )
 
 
-# ============================================================
-# ADMINISTRADORES
-# ============================================================
+def estatisticas():
+    total = green_total + red_total
+    aproveitamento = green_total / total * 100 if total else 0
+    return (
+        '📊 <b>ESTATÍSTICAS</b>\n\n'
+        f'🟢 GREEN: <b>{green_total}</b>\n'
+        f'🔴 RED: <b>{red_total}</b>\n\n'
+        f'📈 Aproveitamento: <b>{aproveitamento:.1f}%</b>'
+    )
 
-async def is_admin(update: Update) -> bool:
 
-    if not update.effective_chat or not update.effective_user:
-        return False
-
+async def apagar_mensagem(bot, chat, message_id):
     try:
-        member = await update.effective_chat.get_member(
-            update.effective_user.id
-        )
-
-        return member.status in ("administrator", "creator")
-
-    except Exception as e:
-        logger.error("Erro verificando administrador: %s", e)
-        return False
-
-
-# ============================================================
-# GERADOR DE ESTRELAS
-# ============================================================
-
-def generate_board():
-
-    positions = list(range(25))
-
-    selected = random.sample(
-        positions,
-        STARS
-    )
-
-    board = []
-
-    for position in range(25):
-
-        if position in selected:
-            board.append("⭐")
-        else:
-            board.append("🟦")
-
-    return board
-
-
-def format_board(board):
-
-    rows = []
-
-    for i in range(0, 25, 5):
-        rows.append(
-            "".join(board[i:i + 5])
-        )
-
-    return "\n".join(rows)
-
-
-# ============================================================
-# HORÁRIO
-# ============================================================
-
-def get_valid_until():
-
-    now = datetime.now()
-
-    end = now + timedelta(
-        seconds=VALID_SECONDS
-    )
-
-    return end.strftime("%H:%M")
-
-
-# ============================================================
-# ESTATÍSTICAS
-# ============================================================
-
-def get_percentage():
-
-    total = state.green + state.red
-
-    if total == 0:
-        return 0
-
-    return round(
-        (state.green / total) * 100,
-        1
-    )
-
-
-# ============================================================
-# TECLADO DO SINAL
-# ============================================================
-
-def signal_keyboard():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🎮 ABRIR MINES — BETANO",
-                url=BETANO_URL
-            )
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-# ============================================================
-# TECLADO DO RESULTADO
-# ============================================================
-
-def result_keyboard():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🟢 GREEN",
-                callback_data="result_green"
-            ),
-            InlineKeyboardButton(
-                "🔴 RED",
-                callback_data="result_red"
-            ),
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    text = (
-        "🤖 *BOT MINES*\n\n"
-        "Sistema de sinais para o grupo.\n\n"
-        "Comandos disponíveis:\n"
-        "▶️ /iniciar — iniciar sinais\n"
-        "⏹ /parar — parar sinais\n"
-        "📊 /stats — estatísticas\n"
-        "ℹ️ /status — status do bot\n"
-        "🎯 /sinal — gerar sinal manual\n"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# /STATUS
-# ============================================================
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if state.running:
-
-        status_text = "🟢 ATIVO"
-
-    else:
-
-        status_text = "🔴 PARADO"
-
-    text = (
-        "🤖 *STATUS DO BOT*\n\n"
-        f"Estado: {status_text}\n"
-        f"💣 Minas: {MINES}\n"
-        f"⭐ Estrelas: {STARS}\n"
-        f"🎯 Tentativas: {ATTEMPTS}\n"
-        f"⏱ Validade: 3 minutos\n"
-        f"📨 Sinais gerados: {state.total_signals}\n"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# /STATS
-# ============================================================
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    total = state.green + state.red
-    percentage = get_percentage()
-
-    text = (
-        "📊 *ESTATÍSTICAS*\n\n"
-        f"🟢 Green: {state.green}\n"
-        f"🔴 Red: {state.red}\n"
-        f"📈 Total: {total}\n"
-        f"🎯 Aproveitamento: {percentage}%\n"
-        f"📨 Sinais: {state.total_signals}\n"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# MENSAGEM DE RESULTADO
-# ============================================================
-
-async def send_result_message(chat_id, context):
-
-    text = (
-        "🏁 *ENTRADA ENCERRADA*\n\n"
-        "Informe o resultado da entrada:\n\n"
-        "👇 Clique no resultado abaixo."
-    )
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="Markdown",
-        reply_markup=result_keyboard()
-    )
-
-
-# ============================================================
-# CICLO
-# ============================================================
-
-async def run_cycle(chat_id, context):
-
-    while state.running:
-
-        try:
-
-            # ------------------------------------------------
-            # 1. VALIDANDO ENTRADA
-            # ------------------------------------------------
-
-            prepare_message = await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "⏳ *VALIDANDO ENTRADA*\n\n"
-                    "⚠️ Prepare-se!\n"
-                    "Uma nova entrada está sendo analisada..."
-                ),
-                parse_mode="Markdown"
-            )
-
-            await asyncio.sleep(
-                PREPARE_SECONDS
-            )
-
-            if not state.running:
-                return
-
-            # ------------------------------------------------
-            # APAGA A MENSAGEM
-            # ------------------------------------------------
-
-            try:
-
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=prepare_message.message_id
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "Não foi possível apagar mensagem: %s",
-                    e
-                )
-
-            # ------------------------------------------------
-            # 2. GERA SINAL
-            # ------------------------------------------------
-
-            board = generate_board()
-
-            board_text = format_board(
-                board
-            )
-
-            valid_until = get_valid_until()
-
-            state.total_signals += 1
-
-            state.voters.clear()
-
-            signal_id = state.total_signals
-
-            state.current_signal = signal_id
-
-            text = (
-                "🟢 *ENTRADA CONFIRMADA*\n\n"
-                f"{board_text}\n\n"
-                f"💣 *Minas:* {MINES}\n"
-                f"⏱ *Válido até:* {valid_until}\n"
-                f"🎯 *Tentativas:* {ATTEMPTS}\n\n"
-                "⚠️ Jogue dentro do período indicado."
-            )
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=signal_keyboard()
-            )
-
-            # ------------------------------------------------
-            # 3. AGUARDA 3 MINUTOS
-            # ------------------------------------------------
-
-            await asyncio.sleep(
-                VALID_SECONDS
-            )
-
-            if not state.running:
-                return
-
-            # ------------------------------------------------
-            # 4. RESULTADO
-            # ------------------------------------------------
-
-            await send_result_message(
-                chat_id,
-                context
-            )
-
-            # ------------------------------------------------
-            # 5. ESPERA 1 MINUTO
-            # ------------------------------------------------
-
-            await asyncio.sleep(
-                NEXT_ROUND_DELAY
-            )
-
-        except asyncio.CancelledError:
-
-            logger.info(
-                "Ciclo cancelado."
-            )
-
-            return
-
-        except Exception as e:
-
-            logger.exception(
-                "Erro no ciclo: %s",
-                e
-            )
-
-            await asyncio.sleep(
-                10
-            )
-
-
-# ============================================================
-# /INICIAR
-# ============================================================
-
-async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await is_admin(update):
-
-        await update.message.reply_text(
-            "❌ Apenas administradores podem iniciar o bot."
-        )
-
-        return
-
-    if state.running:
-
-        await update.message.reply_text(
-            "⚠️ O sistema já está funcionando."
-        )
-
-        return
-
-    state.running = True
-
-    chat_id = update.effective_chat.id
-
-    state.task = asyncio.create_task(
-        run_cycle(
-            chat_id,
-            context
-        )
-    )
-
-    await update.message.reply_text(
-        "🟢 *SISTEMA INICIADO*\n\n"
-        "Aguardando o próximo ciclo...",
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# /PARAR
-# ============================================================
-
-async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await is_admin(update):
-
-        await update.message.reply_text(
-            "❌ Apenas administradores podem parar o bot."
-        )
-
-        return
-
-    if not state.running:
-
-        await update.message.reply_text(
-            "⚠️ O sistema já está parado."
-        )
-
-        return
-
-    state.running = False
-
-    if state.task:
-
-        state.task.cancel()
-
-        state.task = None
-
-    state.current_signal = None
-
-    await update.message.reply_text(
-        "🔴 *SISTEMA PARADO*",
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# /SINAL
-# ============================================================
-
-async def sinal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not await is_admin(update):
-
-        await update.message.reply_text(
-            "❌ Apenas administradores podem gerar sinais."
-        )
-
-        return
-
-    chat_id = update.effective_chat.id
-
-    # Validação
-
-    prepare_message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "⏳ *VALIDANDO ENTRADA*\n\n"
-            "⚠️ Prepare-se!\n"
-            "Nova entrada sendo analisada..."
-        ),
-        parse_mode="Markdown"
-    )
-
-    await asyncio.sleep(
-        PREPARE_SECONDS
-    )
-
-    try:
-
-        await context.bot.delete_message(
-            chat_id=chat_id,
-            message_id=prepare_message.message_id
-        )
-
+        await bot.delete_message(chat_id=chat, message_id=message_id)
     except Exception:
         pass
 
-    board = generate_board()
 
-    board_text = format_board(
-        board
+async def enviar_sinal(bot, chat):
+    global round_number, round_green, round_red
+    round_number += 1
+    round_green = 0
+    round_red = 0
+
+    aviso = await bot.send_message(
+        chat_id=chat,
+        text=(
+            '⚠️ <b>VALIDANDO ENTRADA...</b>\n\n'
+            '🚨 Prepare-se!\n\n'
+            f'O próximo sinal será enviado em <b>{PREPARE_SECONDS} segundos</b>.'
+        ),
+        parse_mode='HTML'
     )
 
-    valid_until = get_valid_until()
+    await asyncio.sleep(PREPARE_SECONDS)
+    await apagar_mensagem(bot, chat, aviso.message_id)
 
-    state.total_signals += 1
+    inicio = datetime.now()
+    validade = inicio + timedelta(seconds=VALID_SECONDS)
+    grade = gerar_grade()
 
-    state.current_signal = state.total_signals
-
-    state.voters.clear()
-
-    text = (
-        "🟢 *ENTRADA CONFIRMADA*\n\n"
-        f"{board_text}\n\n"
-        f"💣 *Minas:* {MINES}\n"
-        f"⏱ *Válido até:* {valid_until}\n"
-        f"🎯 *Tentativas:* {ATTEMPTS}\n\n"
-        "⚠️ Jogue dentro do período indicado."
+    await bot.send_message(
+        chat_id=chat,
+        text=(
+            '✅ <b>ENTRADA CONFIRMADA</b>\n\n'
+            f'{grade}\n\n'
+            f'💣 Minas: <b>{MINES}</b>\n'
+            f'⏱️ Válido até: <b>{validade.strftime("%H:%M")}</b>\n'
+            f'🎯 Tentativas: <b>{ATTEMPTS}</b>\n\n'
+            '⚠️ Use gerenciamento de banca.'
+        ),
+        parse_mode='HTML'
     )
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="Markdown",
-        reply_markup=signal_keyboard()
+    await asyncio.sleep(VALID_SECONDS)
+
+    botoes = InlineKeyboardMarkup([[
+        InlineKeyboardButton('🟢 GREEN', callback_data=f'green_{round_number}'),
+        InlineKeyboardButton('🔴 RED', callback_data=f'red_{round_number}')
+    ]])
+
+    await bot.send_message(
+        chat_id=chat,
+        text='⏰ <b>ENTRADA ENCERRADA</b>\n\nComo foi o resultado dessa entrada?',
+        parse_mode='HTML',
+        reply_markup=botoes
+    )
+
+    await asyncio.sleep(RESTART_SECONDS)
+
+
+async def ciclo(application):
+    global running
+    while running:
+        try:
+            if chat_id is None:
+                running = False
+                break
+            await enviar_sinal(application.bot, chat_id)
+        except asyncio.CancelledError:
+            break
+        except Exception as erro:
+            print('Erro no ciclo:', repr(erro))
+            await asyncio.sleep(10)
+
+
+async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global running, cycle_task, chat_id
+    chat_id = update.effective_chat.id
+    if running:
+        await update.message.reply_text('🟢 O bot já está funcionando.')
+        return
+    running = True
+    cycle_task = asyncio.create_task(ciclo(context.application))
+    await update.message.reply_text(
+        '🟢 <b>BOT INICIADO</b>\n\nO primeiro aviso será enviado automaticamente.',
+        parse_mode='HTML'
     )
 
 
-# ============================================================
-# BOTÕES GREEN / RED
-# ============================================================
+async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global running, cycle_task
+    running = False
+    if cycle_task and not cycle_task.done():
+        cycle_task.cancel()
+    cycle_task = None
+    await update.message.reply_text('🔴 <b>BOT PARADO</b>.', parse_mode='HTML')
 
-async def result_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(estatisticas(), parse_mode='HTML')
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global green_total, red_total
+    green_total = 0
+    red_total = 0
+    await update.message.reply_text('♻️ <b>ESTATÍSTICAS ZERADAS</b>', parse_mode='HTML')
+
+
+async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global green_total, red_total, round_green, round_red
     query = update.callback_query
-
     await query.answer()
-
-    user_id = query.from_user.id
-
-    # --------------------------------------------------------
-    # Evita voto duplicado
-    # --------------------------------------------------------
-
-    if user_id in state.voters:
-
-        await query.answer(
-            "⚠️ Você já registrou o resultado.",
-            show_alert=True
+    tipo = query.data.split('_', 1)[0]
+    if tipo == 'green':
+        green_total += 1
+        round_green += 1
+    elif tipo == 'red':
+        red_total += 1
+        round_red += 1
+    try:
+        await query.edit_message_text(
+            text=(
+                '📊 <b>RESULTADO REGISTRADO</b>\n\n'
+                f'🟢 Green nesta entrada: <b>{round_green}</b>\n'
+                f'🔴 Red nesta entrada: <b>{round_red}</b>\n\n'
+                f'📈 Total Green: <b>{green_total}</b>\n'
+                f'📉 Total Red: <b>{red_total}</b>'
+            ),
+            parse_mode='HTML'
         )
+    except Exception:
+        pass
 
-        return
-
-    # --------------------------------------------------------
-    # Verifica se existe sinal
-    # --------------------------------------------------------
-
-    if state.current_signal is None:
-
-        await query.answer(
-            "⚠️ Não existe entrada ativa.",
-            show_alert=True
-        )
-
-        return
-
-    state.voters.add(
-        user_id
-    )
-
-    # --------------------------------------------------------
-    # GREEN
-    # --------------------------------------------------------
-
-    if query.data == "result_green":
-
-        state.green += 1
-
-        result = "🟢 GREEN"
-
-    # --------------------------------------------------------
-    # RED
-    # --------------------------------------------------------
-
-    else:
-
-        state.red += 1
-
-        result = "🔴 RED"
-
-    percentage = get_percentage()
-
-    text = (
-        "📊 *RESULTADO REGISTRADO*\n\n"
-        f"{result}\n\n"
-        f"🟢 Green: {state.green}\n"
-        f"🔴 Red: {state.red}\n"
-        f"📈 Aproveitamento: {percentage}%\n\n"
-        "⏳ Próxima entrada em breve."
-    )
-
-    await query.message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# ERROS
-# ============================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    logger.exception(
-        "Erro não tratado:",
-        exc_info=context.error
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
-
-    if (
-        not BOT_TOKEN
-        or BOT_TOKEN == "8784168989:AAEotzECNlSroRdVqpH0ccdhGi6qHeKZYAk"
-    ):
-
-        raise RuntimeError(
-            "Configure o BOT_TOKEN antes de iniciar."
-        )
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    # Comandos
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "iniciar",
-            iniciar
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "parar",
-            parar
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "stats",
-            stats
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "status",
-            status
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "sinal",
-            sinal
-        )
-    )
-
-    # Botões
-
-    application.add_handler(
-        CallbackQueryHandler(
-            result_callback,
-            pattern="^result_(green|red)$"
-        )
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    logger.info(
-        "Bot iniciado."
-    )
-
-    application.run_polling()
+    if not TOKEN or TOKEN == '8784168989:AAEotzECNlSroRdVqpH0ccdhGi6qHeKZYAk':
+        raise RuntimeError('Defina a variável BOT_TOKEN com o token do BotFather.')
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler('iniciar', iniciar))
+    application.add_handler(CommandHandler('parar', parar))
+    application.add_handler(CommandHandler('status', status))
+    application.add_handler(CommandHandler('reset', reset))
+    application.add_handler(CallbackQueryHandler(resultado, pattern=r'^(green|red)_\d+$'))
+    print('🤖 Bot online!')
+    application.run_polling(drop_pending_updates=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
